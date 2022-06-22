@@ -87,13 +87,9 @@ func Worker(filename string, serverUrl string, dstPath string) {
 	log.Printf("Downloaded contents of %s to location %s", fullUrl, fullPath)
 }
 
-func main() {
-	serverUrlPtr := flag.String("url", "http://localhost:8080", "url to file server")
-	dstPathPtr := flag.String("dst", "dst", "path to directory")
-	flag.Parse()
-
-	log.Printf("Will download files from URL %s to folder %s", *serverUrlPtr, *dstPathPtr)
-	resp, err := http.Get(*serverUrlPtr)
+func Download(serverUrl string, dstPath string) {
+	log.Printf("Will download files from URL %s to folder %s", serverUrl, dstPath)
+	resp, err := http.Get(serverUrl)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,7 +100,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Got HTML page from %s", *serverUrlPtr)
+	log.Printf("Got HTML page from %s", serverUrl)
 
 	xpath := xmlpath.MustCompile("/html/body/pre/a")
 
@@ -113,11 +109,11 @@ func main() {
 
 	for iter := xpath.Iter(root); iter.Next(); {
 		filename := iter.Node().String()
-		filepaths = append(filepaths, path.Join(*dstPathPtr, filename))
+		filepaths = append(filepaths, path.Join(dstPath, filename))
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			Worker(filename, *serverUrlPtr, *dstPathPtr)
+			Worker(filename, serverUrl, dstPath)
 		}()
 	}
 	wg.Wait()
@@ -161,4 +157,12 @@ func main() {
 			}
 		}
 	}
+}
+
+func main() {
+	serverUrlPtr := flag.String("url", "http://localhost:8080", "url to file server")
+	dstPathPtr := flag.String("dst", "dst", "path to directory")
+	flag.Parse()
+
+	Download(*serverUrlPtr, *dstPathPtr)
 }
