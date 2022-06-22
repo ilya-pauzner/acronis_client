@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"gopkg.in/xmlpath.v2"
 	"io"
@@ -9,8 +10,42 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"sync"
 )
+
+const chunkSize = 1024
+
+type Record struct {
+	filepath string
+	indexOfA int
+}
+
+func IndexOfCharInFile(filepath string, ch byte) int {
+	buffer := make([]byte, chunkSize)
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	length := 0
+	for {
+		bytesread, err := f.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				log.Fatal(err)
+			}
+			break
+		}
+		if idx := bytes.IndexByte(buffer[:bytesread], ch); idx != -1 {
+			return length + idx
+		}
+		length += bytesread
+	}
+	return -1
+}
 
 func JoinPath(baseUrl string, relativeUrl string) (string, error) {
 	baseUrlParsed, err := url.Parse(baseUrl)
@@ -25,7 +60,7 @@ func JoinPath(baseUrl string, relativeUrl string) (string, error) {
 	return resultUrlParsed.String(), nil
 }
 
-func worker(filename string, serverUrl string, dstPath string) {
+func Worker(filename string, serverUrl string, dstPath string) {
 	fullPath := path.Join(dstPath, filename)
 	f, err := os.Create(fullPath)
 	if err != nil {
@@ -48,13 +83,16 @@ func worker(filename string, serverUrl string, dstPath string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	log.Printf("Downloaded contents of %s to location %s", fullUrl, fullPath)
 }
 
 func main() {
 	serverUrlPtr := flag.String("url", "http://localhost:8080", "url to file server")
-	dstPathPtr := flag.String("dst", ".", "path to directory")
+	dstPathPtr := flag.String("dst", "dst", "path to directory")
 	flag.Parse()
 
+	log.Printf("Will download files from URL %s to folder %s", *serverUrlPtr, *dstPathPtr)
 	resp, err := http.Get(*serverUrlPtr)
 	if err != nil {
 		log.Fatal(err)
@@ -66,16 +104,61 @@ func main() {
 		log.Fatal(err)
 	}
 
+	log.Printf("Got HTML page from %s", *serverUrlPtr)
+
 	xpath := xmlpath.MustCompile("/html/body/pre/a")
 
 	var wg sync.WaitGroup
+	var filepaths = make([]string, 0)
+
 	for iter := xpath.Iter(root); iter.Next(); {
 		filename := iter.Node().String()
+		filepaths = append(filepaths, path.Join(*dstPathPtr, filename))
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(filename, *serverUrlPtr, *dstPathPtr)
+			Worker(filename, *serverUrlPtr, *dstPathPtr)
 		}()
 	}
 	wg.Wait()
+
+	records := make([]Record, 0)
+	for _, filepath := range filepaths {
+		records = append(records, Record{
+			filepath: filepath,
+			indexOfA: IndexOfCharInFile(filepath, 'A'),
+		})
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].indexOfA < records[j].indexOfA
+	})
+
+	if len(records) > 0 && records[len(records)-1].indexOfA > -1 {
+		minIdx := -1
+		for _, record := range records {
+			if record.indexOfA > -1 {
+				minIdx = record.indexOfA
+				break
+			}
+		}
+		log.Printf("Earliest position where 'A' occured in all files is %d", minIdx)
+		for _, record := range records {
+			if record.indexOfA != minIdx {
+				err = os.Remove(record.filepath)
+				log.Printf("%s deleted due to having 'A' too late or not having at all", record.filepath)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+		}
+	} else {
+		for _, record := range records {
+			err = os.Remove(record.filepath)
+			log.Printf("%s deleted due to having 'A' too late or not having at all", record.filepath)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
 }
