@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/md5"
 	"gorm.io/gorm/utils/tests"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +11,23 @@ import (
 	"sort"
 	"testing"
 )
+
+func md5SumOfFile(path string) ([]byte, error) {
+	f1, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	defer f1.Close()
+
+	f1hash := md5.New()
+	_, err = io.Copy(f1hash, f1)
+	if err != nil {
+		return nil, err
+	}
+
+	return f1hash.Sum(nil), nil
+}
 
 func Test(t *testing.T) {
 	srv := httptest.NewServer(http.FileServer(http.Dir("input")))
@@ -38,4 +57,31 @@ func Test(t *testing.T) {
 
 	sort.Strings(files)
 	tests.AssertEqual(t, files, []string{"2", "4"})
+
+	for _, pair := range []struct {
+		path1 string
+		path2 string
+	}{
+		{
+			path1: "input/2",
+			path2: "output/2",
+		},
+		{
+			path1: "input/4",
+			path2: "output/4",
+		},
+	} {
+		f1sum, err := md5SumOfFile(pair.path1)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		f2sum, err := md5SumOfFile(pair.path2)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		tests.AssertEqual(t, f1sum, f2sum)
+	}
+
 }
