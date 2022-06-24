@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"sort"
 	"testing"
 )
@@ -29,59 +30,84 @@ func md5SumOfFile(path string) ([]byte, error) {
 	return f1hash.Sum(nil), nil
 }
 
-func Test(t *testing.T) {
-	srv := httptest.NewServer(http.FileServer(http.Dir("input")))
-	defer srv.Close()
-
-	err := os.RemoveAll("output")
+func getSortedFilesList(dir string) ([]string, error) {
+	output, err := os.Open(dir)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	err = os.Mkdir("output", os.ModeDir)
-	if err != nil {
-		log.Fatal(err)
-	}
+	defer output.Close()
 
-	Download(srv.URL, "output")
-
-	dir, err := os.Open("output")
+	files, err := output.Readdirnames(0)
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer dir.Close()
-
-	files, err := dir.Readdirnames(0)
-	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	sort.Strings(files)
-	tests.AssertEqual(t, files, []string{"2", "4"})
 
-	for _, pair := range []struct {
-		path1 string
-		path2 string
-	}{
-		{
-			path1: "input/2",
-			path2: "output/2",
-		},
-		{
-			path1: "input/4",
-			path2: "output/4",
-		},
-	} {
-		f1sum, err := md5SumOfFile(pair.path1)
+	return files, nil
+}
+
+func testDirectory(t *testing.T, prefix string) error {
+	inputDir := path.Join(prefix, "input")
+	outputDir := path.Join(prefix, "output")
+	etalonDir := path.Join(prefix, "etalon")
+
+	srv := httptest.NewServer(http.FileServer(http.Dir(inputDir)))
+	defer srv.Close()
+
+	err := os.RemoveAll(outputDir)
+	if err != nil {
+		return err
+	}
+	err = os.Mkdir(outputDir, os.ModeDir)
+	if err != nil {
+		return err
+	}
+
+	Download(srv.URL, outputDir)
+
+	etalonFiles, err := getSortedFilesList(etalonDir)
+	if err != nil {
+		return err
+	}
+	outputFiles, err := getSortedFilesList(outputDir)
+	if err != nil {
+		return err
+	}
+	tests.AssertEqual(t, etalonFiles, outputFiles)
+
+	for _, name := range etalonFiles {
+		path1 := path.Join(etalonDir, name)
+		f1sum, err := md5SumOfFile(path1)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
-		f2sum, err := md5SumOfFile(pair.path2)
+		path2 := path.Join(outputDir, name)
+		f2sum, err := md5SumOfFile(path2)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		tests.AssertEqual(t, f1sum, f2sum)
 	}
+	return nil
+}
 
+func Test1(t *testing.T) {
+	if err := testDirectory(t, path.Join("tests", "1")); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func Test2(t *testing.T) {
+	if err := testDirectory(t, path.Join("tests", "2")); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func Test3(t *testing.T) {
+	if err := testDirectory(t, path.Join("tests", "3")); err != nil {
+		log.Fatal(err)
+	}
 }
