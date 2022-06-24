@@ -6,45 +6,21 @@ import (
 	"gopkg.in/xmlpath.v2"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"sort"
 	"sync"
 )
 
-const chunkSize = 1024
+const chunkSize = 64 * 1024
+const notFound = int64(math.MaxInt64)
 
-type Record struct {
-	filepath string
-	indexOfA int
-}
-
-func IndexOfCharInFile(filepath string, ch byte) int {
-	buffer := make([]byte, chunkSize)
-
-	f, err := os.Open(filepath)
+func failIfNotNil(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
-
-	length := 0
-	for {
-		bytesread, err := f.Read(buffer)
-		if err != nil {
-			if err != io.EOF {
-				log.Fatal(err)
-			}
-			break
-		}
-		if idx := bytes.IndexByte(buffer[:bytesread], ch); idx != -1 {
-			return length + idx
-		}
-		length += bytesread
-	}
-	return -1
 }
 
 func JoinPath(baseUrl string, relativeUrl string) (string, error) {
@@ -60,100 +36,174 @@ func JoinPath(baseUrl string, relativeUrl string) (string, error) {
 	return resultUrlParsed.String(), nil
 }
 
-func Worker(filename string, serverUrl string, dstPath string) {
-	fullPath := path.Join(dstPath, filename)
-	f, err := os.Create(fullPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
+func Step(name string, bodies *map[string]io.ReadCloser, files *map[string]io.WriteCloser, portions, lengths, positionOfA *sync.Map) {
+	limited := io.LimitReader((*bodies)[name], chunkSize)
+	buf, err := io.ReadAll(limited)
+	failIfNotNil(err)
 
-	fullUrl, err := JoinPath(serverUrl, filename)
-	if err != nil {
-		log.Fatal(err)
-	}
+	written, err := io.Copy((*files)[name], bytes.NewReader(buf))
+	failIfNotNil(err)
 
-	resp, err := http.Get(fullUrl)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
+	portions.Store(name, written)
 
-	_, err = io.Copy(f, resp.Body)
-	if err != nil {
-		log.Fatal(err)
+	length, ok := lengths.Load(name)
+	if !ok {
+		log.Fatalf("No file %s in lengths map for some reason", name)
 	}
 
-	log.Printf("Downloaded contents of %s to location %s", fullUrl, fullPath)
+	idx := bytes.IndexByte(buf, 'A')
+	if idx != -1 {
+		positionOfA.Store(name, length.(int64)+int64(idx))
+	}
+
+	lengths.Store(name, length.(int64)+written)
 }
 
-func Download(serverUrl string, dstPath string) {
-	log.Printf("Will download files from URL %s to folder %s", serverUrl, dstPath)
+func CleanAndClose(name string, bodies *map[string]io.ReadCloser, files *map[string]io.WriteCloser) error {
+	err := (*bodies)[name].Close()
+	if err != nil {
+		return err
+	}
+	log.Printf("Stopped downloading file %s", name)
+	delete(*bodies, name)
+
+	err = (*files)[name].Close()
+	if err != nil {
+		return err
+	}
+	log.Printf("Closed for writing file %s", name)
+	delete(*files, name)
+
+	return nil
+}
+
+func RemoveFile(name string, dstPath string) error {
+	err := os.Remove(path.Join(dstPath, name))
+	if err != nil {
+		return err
+	}
+	log.Printf("Removed file %s", name)
+	return nil
+}
+
+func GatherFilenames(serverUrl string) ([]string, error) {
 	resp, err := http.Get(serverUrl)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	root, err := xmlpath.ParseHTML(resp.Body)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	log.Printf("Got HTML page from %s", serverUrl)
 
 	xpath := xmlpath.MustCompile("/html/body/pre/a")
 
-	var wg sync.WaitGroup
-	var filepaths = make([]string, 0)
-
+	var filenames = make([]string, 0)
 	for iter := xpath.Iter(root); iter.Next(); {
 		filename := iter.Node().String()
-		filepaths = append(filepaths, path.Join(dstPath, filename))
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			Worker(filename, serverUrl, dstPath)
-		}()
-	}
-	wg.Wait()
-
-	records := make([]Record, 0)
-	for _, filepath := range filepaths {
-		records = append(records, Record{
-			filepath: filepath,
-			indexOfA: IndexOfCharInFile(filepath, 'A'),
-		})
+		filenames = append(filenames, filename)
 	}
 
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].indexOfA < records[j].indexOfA
-	})
+	return filenames, nil
+}
 
-	if len(records) > 0 && records[len(records)-1].indexOfA > -1 {
-		minIdx := -1
-		for _, record := range records {
-			if record.indexOfA > -1 {
-				minIdx = record.indexOfA
-				break
-			}
+func Download(serverUrl string, dstPath string) {
+	log.Printf("Will download files from URL %s to folder %s", serverUrl, dstPath)
+
+	filenames, err := GatherFilenames(serverUrl)
+	failIfNotNil(err)
+
+	var bodies = make(map[string]io.ReadCloser)
+	var files = make(map[string]io.WriteCloser)
+	var lengths sync.Map // filename -> total bytes read (>=0)
+
+	for _, filename := range filenames {
+		fullUrl, err := JoinPath(serverUrl, filename)
+		failIfNotNil(err)
+		resp, err := http.Get(fullUrl)
+		failIfNotNil(err)
+		bodies[filename] = resp.Body
+
+		fullPath := path.Join(dstPath, filename)
+		f, err := os.Create(fullPath)
+		failIfNotNil(err)
+		files[filename] = f
+
+		lengths.Store(filename, int64(0))
+	}
+
+	var wg sync.WaitGroup
+	var positionOfA sync.Map // filename -> position (>=0)
+	var portions sync.Map    // filename -> portion size
+	position := notFound
+
+	for len(files) > 0 {
+		for name := range files {
+			wg.Add(1)
+			nameCopy := name
+			go func() {
+				defer wg.Done()
+				Step(nameCopy, &bodies, &files, &portions, &lengths, &positionOfA)
+			}()
 		}
-		log.Printf("Earliest position where 'A' occured in all files is %d", minIdx)
-		for _, record := range records {
-			if record.indexOfA != minIdx {
-				err = os.Remove(record.filepath)
-				log.Printf("%s deleted due to having 'A' too late or not having at all", record.filepath)
-				if err != nil {
-					log.Fatal(err)
+		wg.Wait()
+
+		// not yet found A
+		if position == notFound {
+			for name := range files {
+				maybePosition, ok := positionOfA.Load(name)
+				if ok {
+					if position > maybePosition.(int64) {
+						position = maybePosition.(int64)
+					}
+				}
+			}
+
+			if position != notFound {
+				log.Printf("Earliest position of A was found at %d", position)
+
+				// Stop writing all those with position more or without position altogether
+				blockList := make([]string, 0)
+				for name := range files {
+					maybePosition, ok := positionOfA.Load(name)
+					if !ok || maybePosition.(int64) > position {
+						blockList = append(blockList, name)
+					}
+				}
+
+				// Closing and removing
+				for _, name := range blockList {
+					log.Printf("File %s has no As, or an A too late", name)
+					failIfNotNil(CleanAndClose(name, &bodies, &files))
+					failIfNotNil(RemoveFile(name, dstPath))
 				}
 			}
 		}
-	} else {
-		for _, record := range records {
-			err = os.Remove(record.filepath)
-			log.Printf("%s deleted due to having 'A' too late or not having at all", record.filepath)
-			if err != nil {
-				log.Fatal(err)
+
+		blockList := make([]string, 0)
+		for name := range files {
+			portion, ok := portions.Load(name)
+			if !ok {
+				log.Fatalf("No file %s in portions map for some reason", name)
+			}
+
+			if portion.(int64) != int64(chunkSize) {
+				// because of LimitedReader + ReadAll trick, it means that file has ended
+				blockList = append(blockList, name)
+			}
+		}
+
+		// Closing and maybe removing
+		for _, name := range blockList {
+			log.Printf("File %s has ended", name)
+			failIfNotNil(CleanAndClose(name, &bodies, &files))
+			_, ok := positionOfA.Load(name)
+			if !ok {
+				failIfNotNil(RemoveFile(name, dstPath))
 			}
 		}
 	}
