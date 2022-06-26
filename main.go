@@ -11,11 +11,23 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"sync"
+	"time"
 )
 
-const chunkSize = 64 * 1024
+// set to 0 in release mode
+const debug = 1
+const chunkSize = int64(debug)*2 + int64(1-debug)*64*1024
+const sleepDuration = debug * 10 * time.Second
+
 const notFound = int64(math.MaxInt64)
+
+// Message sent by workers to main
+type Message struct {
+	filename    string
+	finished    bool
+	positionOfA int64
+	length      int64
+}
 
 func failIfNotNil(err error) {
 	if err != nil {
@@ -23,7 +35,7 @@ func failIfNotNil(err error) {
 	}
 }
 
-func JoinPath(baseUrl string, relativeUrl string) (string, error) {
+func joinUrls(baseUrl string, relativeUrl string) (string, error) {
 	baseUrlParsed, err := url.Parse(baseUrl)
 	if err != nil {
 		return "", err
@@ -36,48 +48,7 @@ func JoinPath(baseUrl string, relativeUrl string) (string, error) {
 	return resultUrlParsed.String(), nil
 }
 
-func Step(name string, bodies *map[string]io.ReadCloser, files *map[string]io.WriteCloser, portions, lengths, positionOfA *sync.Map) {
-	limited := io.LimitReader((*bodies)[name], chunkSize)
-	buf, err := io.ReadAll(limited)
-	failIfNotNil(err)
-
-	written, err := io.Copy((*files)[name], bytes.NewReader(buf))
-	failIfNotNil(err)
-
-	portions.Store(name, written)
-
-	length, ok := lengths.Load(name)
-	if !ok {
-		log.Fatalf("No file %s in lengths map for some reason", name)
-	}
-
-	idx := bytes.IndexByte(buf, 'A')
-	if idx != -1 {
-		positionOfA.Store(name, length.(int64)+int64(idx))
-	}
-
-	lengths.Store(name, length.(int64)+written)
-}
-
-func CleanAndClose(name string, bodies *map[string]io.ReadCloser, files *map[string]io.WriteCloser) error {
-	err := (*bodies)[name].Close()
-	if err != nil {
-		return err
-	}
-	log.Printf("Stopped downloading file %s", name)
-	delete(*bodies, name)
-
-	err = (*files)[name].Close()
-	if err != nil {
-		return err
-	}
-	log.Printf("Closed for writing file %s", name)
-	delete(*files, name)
-
-	return nil
-}
-
-func RemoveFile(name string, dstPath string) error {
+func removeFile(name string, dstPath string) error {
 	err := os.Remove(path.Join(dstPath, name))
 	if err != nil {
 		return err
@@ -86,7 +57,7 @@ func RemoveFile(name string, dstPath string) error {
 	return nil
 }
 
-func GatherFilenames(serverUrl string) ([]string, error) {
+func gatherFilenames(serverUrl string) ([]string, error) {
 	resp, err := http.Get(serverUrl)
 	if err != nil {
 		return nil, err
@@ -111,101 +82,125 @@ func GatherFilenames(serverUrl string) ([]string, error) {
 	return filenames, nil
 }
 
+func maybeTerminate(name string, done map[string]chan struct{}, deleteList map[string]bool) {
+	if !deleteList[name] {
+		close(done[name])
+		deleteList[name] = true
+	}
+}
+
+func worker(name string, serverUrl string, dstPath string, ch chan Message, done chan struct{}) {
+	log.Printf("Starting download of file %s", name)
+
+	fullUrl, err := joinUrls(serverUrl, name)
+	failIfNotNil(err)
+	resp, err := http.Get(fullUrl)
+	failIfNotNil(err)
+	defer resp.Body.Close()
+
+	fullPath := path.Join(dstPath, name)
+	f, err := os.Create(fullPath)
+	failIfNotNil(err)
+	defer f.Close()
+
+	length := int64(0)
+	positionOfA := notFound
+	for loop := true; loop; {
+		select {
+		case <-done:
+			log.Printf("Download of file %s prematurely terminated", name)
+			loop = false
+		default:
+			rdr := io.LimitReader(resp.Body, chunkSize)
+
+			chunk, err := io.ReadAll(rdr)
+			failIfNotNil(err)
+			time.Sleep(sleepDuration)
+			written, err := io.Copy(f, bytes.NewReader(chunk))
+			failIfNotNil(err)
+
+			if positionOfA == notFound {
+				idx := bytes.IndexByte(chunk, 'A')
+				if idx != -1 {
+					positionOfA = length + int64(idx)
+				}
+			}
+
+			length += written
+
+			ch <- Message{
+				filename:    name,
+				finished:    false,
+				positionOfA: positionOfA,
+				length:      length,
+			}
+
+			if written < chunkSize {
+				loop = false
+			}
+		}
+	}
+	ch <- Message{
+		filename:    name,
+		finished:    true,
+		positionOfA: positionOfA,
+		length:      length,
+	}
+	log.Printf("Download of file %s finished", name)
+}
+
 func Download(serverUrl string, dstPath string) {
 	log.Printf("Will download files from URL %s to folder %s", serverUrl, dstPath)
 
-	filenames, err := GatherFilenames(serverUrl)
+	filenames, err := gatherFilenames(serverUrl)
 	failIfNotNil(err)
 
-	var bodies = make(map[string]io.ReadCloser)
-	var files = make(map[string]io.WriteCloser)
-	var lengths sync.Map // filename -> total bytes read (>=0)
+	ch := make(chan Message, 2*len(filenames))
 
+	done := make(map[string]chan struct{})
 	for _, filename := range filenames {
-		fullUrl, err := JoinPath(serverUrl, filename)
-		failIfNotNil(err)
-		resp, err := http.Get(fullUrl)
-		failIfNotNil(err)
-		bodies[filename] = resp.Body
-
-		fullPath := path.Join(dstPath, filename)
-		f, err := os.Create(fullPath)
-		failIfNotNil(err)
-		files[filename] = f
-
-		lengths.Store(filename, int64(0))
+		done[filename] = make(chan struct{})
+		go worker(filename, serverUrl, dstPath, ch, done[filename])
 	}
 
-	var wg sync.WaitGroup
-	var positionOfA sync.Map // filename -> position (>=0)
-	var portions sync.Map    // filename -> portion size
-	position := notFound
+	deleteList := make(map[string]bool)
+	positionOfAs := make(map[string]int64)
+	lengths := make(map[string]int64)
 
-	for len(files) > 0 {
-		for name := range files {
-			wg.Add(1)
-			nameCopy := name
-			go func() {
-				defer wg.Done()
-				Step(nameCopy, &bodies, &files, &portions, &lengths, &positionOfA)
-			}()
-		}
-		wg.Wait()
+	finished := 0
+	positionOfA := notFound
+	for finished < len(filenames) {
+		msg := <-ch
+		positionOfAs[msg.filename] = msg.positionOfA
+		lengths[msg.filename] = msg.length
 
-		// not yet found A
-		if position == notFound {
-			for name := range files {
-				maybePosition, ok := positionOfA.Load(name)
-				if ok {
-					if position > maybePosition.(int64) {
-						position = maybePosition.(int64)
-					}
-				}
-			}
+		if positionOfA > msg.positionOfA {
+			positionOfA = msg.positionOfA
 
-			if position != notFound {
-				log.Printf("Earliest position of A was found at %d", position)
+			for _, filename := range filenames {
+				maybeLength, okLength := lengths[filename]
+				maybePosition, okPosition := positionOfAs[filename]
 
-				// Stop writing all those with position more or without position altogether
-				blockList := make([]string, 0)
-				for name := range files {
-					maybePosition, ok := positionOfA.Load(name)
-					if !ok || maybePosition.(int64) > position {
-						blockList = append(blockList, name)
-					}
-				}
-
-				// Closing and removing
-				for _, name := range blockList {
-					log.Printf("File %s has no As, or an A too late", name)
-					failIfNotNil(CleanAndClose(name, &bodies, &files))
-					failIfNotNil(RemoveFile(name, dstPath))
+				if okLength && okPosition && maybeLength > positionOfA && maybePosition > positionOfA {
+					maybeTerminate(filename, done, deleteList)
 				}
 			}
 		}
 
-		blockList := make([]string, 0)
-		for name := range files {
-			portion, ok := portions.Load(name)
-			if !ok {
-				log.Fatalf("No file %s in portions map for some reason", name)
-			}
-
-			if portion.(int64) != int64(chunkSize) {
-				// because of LimitedReader + ReadAll trick, it means that file has ended
-				blockList = append(blockList, name)
-			}
+		if msg.length > positionOfA && msg.positionOfA > positionOfA {
+			maybeTerminate(msg.filename, done, deleteList)
 		}
 
-		// Closing and maybe removing
-		for _, name := range blockList {
-			log.Printf("File %s has ended", name)
-			failIfNotNil(CleanAndClose(name, &bodies, &files))
-			_, ok := positionOfA.Load(name)
-			if !ok {
-				failIfNotNil(RemoveFile(name, dstPath))
+		if msg.finished {
+			if msg.positionOfA == notFound {
+				maybeTerminate(msg.filename, done, deleteList)
 			}
+			finished += 1
 		}
+	}
+
+	for name := range deleteList {
+		failIfNotNil(removeFile(name, dstPath))
 	}
 }
 
